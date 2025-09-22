@@ -239,6 +239,10 @@ class IconButton extends LitElement {
       justify-content: center;
       pointer-events: none;
     }
+    :host([disabled]) {
+      pointer-events: none;
+      opacity: 0.5;
+    }
     :host(:hover) svg {
       transform: scale(1.2);
     }
@@ -263,7 +267,8 @@ class IconButton extends LitElement {
     return svg``; // Default empty icon
   }
 
-  private renderSVG() {
+  // FIX: Changed visibility from private to protected to allow subclasses to access it.
+  protected renderSVG() {
     return html` <svg
       width="140"
       height="140"
@@ -438,6 +443,77 @@ export class ResetButton extends IconButton {
 
   override renderIcon() {
     return this.renderResetIcon();
+  }
+}
+
+@customElement('record-button')
+export class RecordButton extends IconButton {
+  @property({type: Boolean, reflect: true}) isRecording = false;
+
+  static override styles = [
+    IconButton.styles,
+    css`
+      :host([isRecording]) svg path,
+      :host([isRecording]) svg rect,
+      :host([isRecording]) svg circle {
+        fill: #ff4141;
+      }
+      :host([isRecording]) svg {
+        animation: pulse 1.5s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0% {
+          transform: scale(1.2);
+        }
+        50% {
+          transform: scale(1.1);
+        }
+        100% {
+          transform: scale(1.2);
+        }
+      }
+    `,
+  ] as CSSResultGroup;
+
+  private renderRecordIcon() {
+    if (this.isRecording) {
+      return svg`<rect x="58" y="42" width="24" height="24" rx="3" fill="#FEFEFE"/>`;
+    } else {
+      return svg`<circle cx="70" cy="54" r="14" fill="#FEFEFE"/>`;
+    }
+  }
+
+  override renderIcon() {
+    return this.renderRecordIcon();
+  }
+}
+
+@customElement('download-button')
+export class DownloadButton extends IconButton {
+  @property({type: String}) href = '';
+
+  private handleClick() {
+    if (!this.href) return;
+    const a = document.createElement('a');
+    a.href = this.href;
+    a.download = 'prompt-dj-recording.webm';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
+
+  override render() {
+    return html`${this.renderSVG()}<div
+      class="hitbox"
+      @click=${this.handleClick}></div>`;
+  }
+
+  private renderDownloadIcon() {
+    return svg`<path d="M79 58 L79 38 L61 38 L61 58 L52 58 L70 76 L88 58 Z M52 82 L88 82 L88 78 L52 78 Z" fill="#FEFEFE"/>`;
+  }
+
+  override renderIcon() {
+    return this.renderDownloadIcon();
   }
 }
 
@@ -922,7 +998,8 @@ class SettingsController extends LitElement {
     }
   `;
 
-  private readonly defaultConfig = {
+  // FIX: Added explicit LiveMusicGenerationConfig type to fix type inference issue.
+  private readonly defaultConfig: LiveMusicGenerationConfig = {
     temperature: 1.1,
     topK: 40,
     guidance: 4.0,
@@ -1325,7 +1402,9 @@ class PromptDj extends LitElement {
     }
     play-pause-button,
     add-prompt-button,
-    reset-button {
+    reset-button,
+    record-button,
+    download-button {
       width: 12vmin;
       flex-shrink: 0;
     }
@@ -1346,9 +1425,9 @@ class PromptDj extends LitElement {
   private nextPromptId: number; // Monotonically increasing ID for new prompts
   private session: LiveMusicSession;
   private readonly sampleRate = 48000;
-  private audioContext = new (window.AudioContext || window.webkitAudioContext)(
-    {sampleRate: this.sampleRate},
-  );
+  // FIX: Cast window to `any` to allow access to `webkitAudioContext` for older browser compatibility.
+  private audioContext = new (window.AudioContext ||
+    (window as any).webkitAudioContext)({sampleRate: this.sampleRate});
   private outputNode: GainNode = this.audioContext.createGain();
   private nextStartTime = 0;
   private readonly bufferTime = 2; // adds an audio buffer in case of netowrk latency
@@ -1356,6 +1435,12 @@ class PromptDj extends LitElement {
   @property({type: Object})
   private filteredPrompts = new Set<string>();
   private connectionError = true;
+
+  @state() private isRecording = false;
+  @state() private recordedAudioUrl: string | null = null;
+  private mediaRecorder: MediaRecorder | null = null;
+  private recordedChunks: Blob[] = [];
+  private streamDestination!: MediaStreamAudioDestinationNode;
 
   @query('play-pause-button') private playPauseButton!: PlayPauseButton;
   @query('toast-message') private toastMessage!: ToastMessage;
@@ -1365,7 +1450,9 @@ class PromptDj extends LitElement {
     super();
     this.prompts = prompts;
     this.nextPromptId = this.prompts.size;
+    this.streamDestination = this.audioContext.createMediaStreamDestination();
     this.outputNode.connect(this.audioContext.destination);
+    this.outputNode.connect(this.streamDestination);
   }
 
   override async firstUpdated() {
@@ -1527,6 +1614,9 @@ class PromptDj extends LitElement {
   }
 
   private pauseAudio() {
+    if (this.isRecording) {
+      this.handleRecordToggle();
+    }
     this.session.pause();
     this.playbackState = 'paused';
     this.outputNode.gain.setValueAtTime(1, this.audioContext.currentTime);
@@ -1537,6 +1627,7 @@ class PromptDj extends LitElement {
     this.nextStartTime = 0;
     this.outputNode = this.audioContext.createGain();
     this.outputNode.connect(this.audioContext.destination);
+    this.outputNode.connect(this.streamDestination);
   }
 
   private loadAudio() {
@@ -1551,6 +1642,9 @@ class PromptDj extends LitElement {
   }
 
   private stopAudio() {
+    if (this.isRecording) {
+      this.handleRecordToggle();
+    }
     this.session.stop();
     this.playbackState = 'stopped';
     this.outputNode.gain.setValueAtTime(0, this.audioContext.currentTime);
@@ -1559,6 +1653,51 @@ class PromptDj extends LitElement {
       this.audioContext.currentTime + 0.1,
     );
     this.nextStartTime = 0;
+  }
+
+  private handleRecordToggle() {
+    if (this.playbackState === 'stopped' && !this.isRecording) {
+      this.toastMessage.show('Start playback to begin recording.');
+      return;
+    }
+
+    if (this.isRecording) {
+      // Stop recording
+      this.mediaRecorder?.stop();
+      this.isRecording = false;
+    } else {
+      // Start recording
+      this.recordedChunks = [];
+      const options = {mimeType: 'audio/webm'};
+      try {
+        this.mediaRecorder = new MediaRecorder(
+          this.streamDestination.stream,
+          options,
+        );
+      } catch (e) {
+        this.toastMessage.show('Recording is not supported on this browser.');
+        console.error(e);
+        return;
+      }
+
+      this.mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          this.recordedChunks.push(event.data);
+        }
+      };
+
+      this.mediaRecorder.onstop = () => {
+        const blob = new Blob(this.recordedChunks, {type: 'audio/webm'});
+        if (this.recordedAudioUrl) {
+          URL.revokeObjectURL(this.recordedAudioUrl);
+        }
+        this.recordedAudioUrl = URL.createObjectURL(blob);
+      };
+
+      this.mediaRecorder.start();
+      this.isRecording = true;
+      this.recordedAudioUrl = null; // Clear previous download link
+    }
   }
 
   private async handleAddPrompt() {
@@ -1679,7 +1818,15 @@ class PromptDj extends LitElement {
         <play-pause-button
           @click=${this.handlePlayPause}
           .playbackState=${this.playbackState}></play-pause-button>
+        <record-button
+          .isRecording=${this.isRecording}
+          ?disabled=${this.playbackState === 'stopped' && !this.isRecording}
+          @click=${this.handleRecordToggle}></record-button>
         <reset-button @click=${this.handleReset}></reset-button>
+        ${this.recordedAudioUrl
+          ? html`<download-button
+              .href=${this.recordedAudioUrl}></download-button>`
+          : ''}
       </div>
       <toast-message></toast-message>`;
   }
@@ -1769,6 +1916,8 @@ declare global {
     'add-prompt-button': AddPromptButton;
     'play-pause-button': PlayPauseButton;
     'reset-button': ResetButton;
+    'record-button': RecordButton;
+    'download-button': DownloadButton;
     'weight-slider': WeightSlider;
     'toast-message': ToastMessage;
   }
